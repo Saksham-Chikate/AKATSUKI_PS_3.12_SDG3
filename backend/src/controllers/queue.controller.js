@@ -12,6 +12,147 @@ const { Patient } = require('../models');
 const AI_ENGINE_URL = process.env.AI_ENGINE_URL || 'http://localhost:8000';
 
 /**
+ * Local AI Priority Calculator (Fallback when Python AI Engine is unavailable)
+ * Uses the same algorithm as the Python model for consistent scoring
+ * 
+ * Priority Factors (weighted):
+ * - Severity (40%): Higher severity = higher priority
+ * - Age (25%): Elderly (65+) and very young (<5) get priority
+ * - Chronic Illness (20%): Patients with chronic conditions need more attention
+ * - Rural Location (10%): Fairness uplift for limited healthcare access
+ * - Waiting Time (5%): Longer waits gradually increase priority
+ */
+const calculateLocalPriority = (patient) => {
+    const { age, severityScore, location, chronicIllness, chronicConditions = [], waitingTime = 0 } = patient;
+    
+    let score = 0;
+    const factors = [];
+    
+    // 1. SEVERITY SCORE (40% weight) - Most important factor
+    // Scale: 1-10 -> contributes 0-40 points
+    const severityPoints = severityScore * 4;
+    score += severityPoints;
+    
+    if (severityScore >= 8) {
+        factors.push('Critical severity');
+    } else if (severityScore >= 6) {
+        factors.push('High severity');
+    } else if (severityScore >= 4) {
+        factors.push('Moderate severity');
+    } else {
+        factors.push('Low severity');
+    }
+    
+    // 2. AGE FACTOR (25% weight)
+    // Elderly (65+): +20-25 points based on how old
+    // Children (<5): +15 points
+    // Middle-aged (50-64): +10 points
+    if (age >= 75) {
+        score += 25;
+        factors.push('elderly patient (75+)');
+    } else if (age >= 65) {
+        score += 20;
+        factors.push('senior patient (65+)');
+    } else if (age >= 50) {
+        score += 10;
+        factors.push('middle-aged patient');
+    } else if (age < 5) {
+        score += 15;
+        factors.push('infant/toddler');
+    } else if (age < 12) {
+        score += 8;
+        factors.push('child patient');
+    }
+    
+    // 3. CHRONIC ILLNESS (20% weight)
+    // Base: +10 points for any chronic illness
+    // Additional: +3 points per condition (max +15 extra)
+    if (chronicIllness) {
+        score += 10;
+        const conditionCount = chronicConditions.length || 1;
+        const extraPoints = Math.min(conditionCount * 3, 15);
+        score += extraPoints;
+        
+        if (conditionCount >= 3) {
+            factors.push(`multiple chronic conditions (${conditionCount})`);
+        } else if (conditionCount > 0) {
+            factors.push('chronic illness');
+        }
+    }
+    
+    // 4. RURAL LOCATION FAIRNESS (10% weight)
+    // Rural patients face connectivity and access challenges
+    if (location === 'rural') {
+        score += 10;
+        factors.push('rural location (fairness uplift)');
+    }
+    
+    // 5. WAITING TIME (5% weight)
+    // +1 point per 10 minutes waited, max +10 points
+    const waitingBonus = Math.min(Math.floor(waitingTime / 10), 10);
+    if (waitingBonus > 0) {
+        score += waitingBonus;
+        if (waitingTime >= 60) {
+            factors.push('long wait time');
+        } else if (waitingTime >= 30) {
+            factors.push('moderate wait time');
+        }
+    }
+    
+    // Clamp score to 0-100 range
+    score = Math.min(100, Math.max(0, score));
+    
+    // Determine priority level for explanation
+    let priorityLevel;
+    if (score >= 80) {
+        priorityLevel = 'HIGH PRIORITY';
+    } else if (score >= 60) {
+        priorityLevel = 'MEDIUM-HIGH PRIORITY';
+    } else if (score >= 40) {
+        priorityLevel = 'MEDIUM PRIORITY';
+    } else {
+        priorityLevel = 'LOW PRIORITY';
+    }
+    
+    // Build reason string
+    const reason = factors.length > 0 
+        ? `${priorityLevel}: ${factors.join(', ')}`
+        : `${priorityLevel}: Standard case`;
+    
+    return {
+        priority_score: Math.round(score),
+        reason: reason
+    };
+};
+
+/**
+ * Get priority from AI Engine or fallback to local calculation
+ */
+const getPriorityScore = async (patient, waitingTime) => {
+    try {
+        // Try Python AI Engine first
+        const response = await axios.post(
+            `${AI_ENGINE_URL}/predict`,
+            {
+                age: patient.age,
+                severity: patient.severityScore,
+                rural: patient.location === 'rural' ? 1 : 0,
+                chronic: patient.chronicIllness ? 1 : 0,
+                waiting_time: waitingTime
+            },
+            { timeout: 2000 }
+        );
+        return response.data;
+    } catch (error) {
+        // Fallback to local AI calculation
+        return calculateLocalPriority({
+            ...patient.toObject ? patient.toObject() : patient,
+            waitingTime
+        });
+    }
+};
+
+/**
  * @desc    Get optimized patient queue
  * @route   GET /api/queue
  * @access  Private
@@ -39,31 +180,18 @@ const getOptimizedQueue = async (req, res, next) => {
             const joinTime = new Date(patient.queueJoinTime);
             const waitingTime = Math.round((now - joinTime) / (1000 * 60));
 
-            // Only recalculate if waiting time has significantly changed (>5 min)
-            if (Math.abs(waitingTime - patient.waitingTime) > 5) {
-                try {
-                    // Update priority from AI
-                    const response = await axios.post(
-                        `${AI_ENGINE_URL}/predict`,
-                        {
-                            age: patient.age,
-                            severity: patient.severityScore,
-                            rural: patient.location === 'rural' ? 1 : 0,
-                            chronic: patient.chronicIllness ? 1 : 0,
-                            waiting_time: waitingTime
-                        },
-                        { timeout: 3000 }
-                    );
-
-                    patient.waitingTime = waitingTime;
-                    patient.priorityScore = response.data.priority_score;
-                    patient.priorityReason = response.data.reason;
-                    await patient.save();
-                } catch (aiError) {
-                    // Just update waiting time if AI fails
-                    patient.waitingTime = waitingTime;
-                    await patient.save();
-                }
+            // Recalculate priority using AI (local or remote)
+            try {
+                const aiResult = await getPriorityScore(patient, waitingTime);
+                
+                patient.waitingTime = waitingTime;
+                patient.priorityScore = aiResult.priority_score;
+                patient.priorityReason = aiResult.reason;
+                await patient.save();
+            } catch (aiError) {
+                // Just update waiting time if AI fails
+                patient.waitingTime = waitingTime;
+                await patient.save();
             }
 
             updatedPatients.push(patient);
@@ -188,21 +316,12 @@ const bulkRecalculatePriorities = async (req, res, next) => {
                 const joinTime = new Date(patient.queueJoinTime);
                 const waitingTime = Math.round((now - joinTime) / (1000 * 60));
 
-                const response = await axios.post(
-                    `${AI_ENGINE_URL}/predict`,
-                    {
-                        age: patient.age,
-                        severity: patient.severityScore,
-                        rural: patient.location === 'rural' ? 1 : 0,
-                        chronic: patient.chronicIllness ? 1 : 0,
-                        waiting_time: waitingTime
-                    },
-                    { timeout: 3000 }
-                );
+                // Use AI priority calculation (local or remote)
+                const aiResult = await getPriorityScore(patient, waitingTime);
 
                 patient.waitingTime = waitingTime;
-                patient.priorityScore = response.data.priority_score;
-                patient.priorityReason = response.data.reason;
+                patient.priorityScore = aiResult.priority_score;
+                patient.priorityReason = aiResult.reason;
                 await patient.save();
                 updated++;
             } catch (err) {
@@ -212,7 +331,7 @@ const bulkRecalculatePriorities = async (req, res, next) => {
 
         res.json({
             success: true,
-            message: `Priorities recalculated. Updated: ${updated}, Failed: ${failed}`,
+            message: `AI priorities recalculated. Updated: ${updated}, Failed: ${failed}`,
             data: { updated, failed }
         });
     } catch (error) {
